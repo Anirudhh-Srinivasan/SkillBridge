@@ -46,20 +46,72 @@ ROLE_SKILLS = {'software':['Python','JavaScript','SQL','Git','REST APIs','React'
 def required(role):
     return next((v for k,v in ROLE_SKILLS.items() if k in role.lower()), ROLE_SKILLS['software'])
 
+TECH_SKILLS = [
+    'Python','JavaScript','TypeScript','Java','C','C++','C#','Go','Rust','Ruby','PHP','Kotlin','Swift','Scala','R','Bash','PowerShell',
+    'HTML','CSS','Sass','Tailwind CSS','Bootstrap','React','Next.js','Vue','Angular','Svelte','Node.js','Express','FastAPI','Django','Flask','Spring Boot','ASP.NET',
+    'REST APIs','GraphQL','WebSockets','SQL','PostgreSQL','MySQL','SQLite','MongoDB','Redis','DynamoDB','Cassandra','Elasticsearch','Oracle','Microsoft SQL Server',
+    'Git','GitHub','GitLab','Docker','Kubernetes','Terraform','Ansible','Jenkins','GitHub Actions','CI/CD','Linux','Nginx','AWS','Azure','Google Cloud','Serverless',
+    'Pandas','NumPy','SciPy','scikit-learn','TensorFlow','PyTorch','Keras','Machine Learning','Deep Learning','NLP','Computer Vision','Statistics','Data Analysis','Data Visualization','Tableau','Power BI','Apache Spark','Airflow',
+    'Data Structures','Algorithms','Object-Oriented Programming','Microservices','System Design','Agile','Unit Testing','Pytest','Jest','Selenium','Playwright','Figma','Firebase','Supabase','Kafka','RabbitMQ','Prometheus','Grafana'
+]
+
+ROLE_REQUIREMENTS = {
+    'backend developer': ['Python','SQL','REST APIs','Git','Docker','FastAPI'],
+    'backend engineer': ['Python','SQL','REST APIs','Git','Docker','FastAPI'],
+    'frontend developer': ['JavaScript','TypeScript','React','HTML','CSS','Git'],
+    'frontend engineer': ['JavaScript','TypeScript','React','HTML','CSS','Git'],
+    'full stack developer': ['JavaScript','TypeScript','React','Node.js','SQL','Git'],
+    'full-stack developer': ['JavaScript','TypeScript','React','Node.js','SQL','Git'],
+    'data analyst': ['SQL','Python','Pandas','Statistics','Data Visualization','Excel'],
+    'data scientist': ['Python','SQL','Pandas','scikit-learn','Statistics','Machine Learning'],
+    'machine learning engineer': ['Python','SQL','Machine Learning','scikit-learn','PyTorch','Docker'],
+    'ml engineer': ['Python','SQL','Machine Learning','scikit-learn','PyTorch','Docker'],
+    'devops engineer': ['Linux','Docker','Kubernetes','AWS','CI/CD','Terraform'],
+    'software engineer': ['Python','JavaScript','SQL','Git','Data Structures','REST APIs'],
+}
+
+def required_for_role(role: str) -> List[str]:
+    key = role.strip().lower()
+    if key in ROLE_REQUIREMENTS:
+        return ROLE_REQUIREMENTS[key]
+    for role_key, skills in ROLE_REQUIREMENTS.items():
+        if role_key in key or key in role_key:
+            return skills
+    return ROLE_REQUIREMENTS['software engineer']
+
+def extract_resume_fallback(text: str, target_role: str) -> Dict[str, Any]:
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    name = lines[0] if lines else 'Student'
+    name = re.sub(r'^(?:name\s*[:\-]\s*)', '', name, flags=re.I).strip() or 'Student'
+    found = []
+    for skill in TECH_SKILLS:
+        pattern = r'(?<![\w+#.])' + re.escape(skill) + r'(?![\w+#.])'
+        if re.search(pattern, text, re.I):
+            found.append(skill)
+    present = {skill.casefold() for skill in found}
+    needed = required_for_role(target_role)
+    missing = [skill for skill in needed if skill.casefold() not in present]
+    return {'name': name, 'skills': found, 'missing_skills': missing,
+            'match_score': round(100 * (len(needed) - len(missing)) / len(needed)) if needed else 0}
+
 @app.get('/api/health')
 def health(): return {'status':'ok'}
 
 @app.post('/api/resume/parse')
 async def parse_resume(file: UploadFile = File(...), target_role: str = Form(...)):
     text = file_text(await file.read(), file.filename or 'resume.txt')
-    known = ['Python','JavaScript','Java','SQL','React','FastAPI','Git','HTML','CSS','Pandas','Machine Learning','Docker','Excel','REST APIs','Statistics']
-    skills = [s for s in known if re.search(r'\b'+re.escape(s)+r'\b', text, re.I)]
-    name_match = re.search(r'(?im)^name\s*[:\-]\s*(.+)$', text)
-    fallback = {'name': name_match.group(1).strip() if name_match else 'Student', 'skills': skills}
-    parsed = llm_json('Extract only JSON with name and skills array.', text[:10000], fallback)
-    skills = [str(x) for x in parsed.get('skills', skills)] if isinstance(parsed.get('skills', skills), list) else skills
-    needed = required(target_role); have = {x.lower() for x in skills}; missing = [x for x in needed if x.lower() not in have]
-    return {'name':str(parsed.get('name', fallback['name'])),'skills':skills,'missing_skills':missing,'match_score':round(100*(len(needed)-len(missing))/len(needed))}
+    fallback = extract_resume_fallback(text, target_role)
+    parsed = llm_json('Extract only JSON with name and skills array.', text[:10000], {'name':fallback['name'],'skills':fallback['skills']})
+    # Keep the deterministic role comparison and use LLM extraction only when it
+    # returned a valid skill list; the fallback path always uses the keyword bank.
+    skills = [str(x) for x in parsed.get('skills', fallback['skills'])] if isinstance(parsed.get('skills', fallback['skills']), list) else fallback['skills']
+    if parsed is not None and parsed.get('skills') is not None:
+        present = {skill.casefold() for skill in skills}
+        needed = required_for_role(target_role)
+        missing = [skill for skill in needed if skill.casefold() not in present]
+        score = round(100 * (len(needed)-len(missing))/len(needed)) if needed else 0
+        return {'name':str(parsed.get('name',fallback['name'])),'skills':skills,'missing_skills':missing,'match_score':score}
+    return fallback
 
 class TestGenerate(BaseModel): skills: List[str]
 class TestSubmit(BaseModel): answers: List[Dict[str,Any]]; questions: List[Dict[str,Any]]
@@ -151,20 +203,135 @@ def submit_test(b: TestSubmit):
 
 @app.post('/api/interview/next')
 def interview_next(b: InterviewNext):
-    n=sum(x.get('role')=='user' for x in b.history)
-    qs=['Tell me about a project relevant to '+b.target_role+'.','How did you debug a difficult issue?','Explain a key design decision.','How do you handle conflicting deadlines?','Why should a team choose you?'] if b.type=='technical' else ['Tell me about yourself.','Describe a time you handled feedback.','How do you collaborate?','Tell me about a failure and what you learned.','Why this role?']
-    fallback={'reply':qs[n] if n<5 else 'That completes the interview.','done':n>=5}
+    fallback = interview_next_fallback(b.type, b.target_role, b.history)
     result=llm_json('Return a JSON object with reply (one concise interview question) and done (boolean). Tailor it to the interview type and target role, use the history to avoid repeating questions, and set done=true only after five candidate answers.',json.dumps({'type':b.type,'target_role':b.target_role,'history':b.history}),fallback)
     return {'reply':str(result.get('reply',fallback['reply'])),'done':bool(result.get('done',fallback['done']))}
 
+TECH_INTERVIEW_BANK = [
+    'How would you diagnose a slow request in a {role} system, and what measurements would you collect before changing it?',
+    'How would you design a reliable interface between two parts of a {role} system when requests can fail or be retried?',
+    'How would you test a {role} feature that depends on external data or services, including important edge cases?',
+    'Describe a performance or reliability trade-off you would consider in a {role} system. How would you decide between the options?',
+    'A {role} change works locally but fails after release. What steps would you take to isolate the cause and reduce user impact?',
+]
+HR_INTERVIEW_BANK = [
+    'Tell me about a time you worked with a teammate whose approach differed from yours. How did you reach a good outcome?',
+    'Describe a disagreement or conflict at work or on a project. What did you do, and what happened?',
+    'What is one strength you rely on in a team, and what is one skill you are actively working to improve?',
+    'Tell me about a time you received difficult feedback. How did you respond and what changed afterward?',
+    'Why are you interested in this role, and what would you hope to contribute in your first few months?',
+]
+
+def interview_next_fallback(interview_type: str, target_role: str, history: List[Dict[str, str]]) -> Dict[str, Any]:
+    answered = sum(message.get('role') == 'user' for message in history)
+    if answered >= 5:
+        return {'reply':'Thank you for walking me through your examples. That completes our interview.', 'done':True}
+    latest_answer = next((str(message.get('content','')).strip() for message in reversed(history)
+                         if message.get('role') == 'user' and str(message.get('content','')).strip()), '')
+    if interview_type.lower() == 'technical':
+        role = target_role.lower()
+        if 'ml' in role or 'machine learning' in role:
+            label = 'machine learning'
+        elif 'full stack' in role or 'full-stack' in role:
+            label = 'full-stack application'
+        elif 'frontend' in role or 'front-end' in role:
+            label = 'frontend application'
+        elif 'backend' in role or 'back-end' in role:
+            label = 'backend service'
+        elif 'data' in role:
+            label = 'data platform'
+        elif 'devops' in role or 'operations' in role:
+            label = 'DevOps environment'
+        else:
+            label = target_role
+        question = TECH_INTERVIEW_BANK[answered].format(role=label)
+    else:
+        question = HR_INTERVIEW_BANK[answered]
+    reaction = ''
+    if latest_answer:
+        reaction = 'Thanks for explaining that. ' if len(latest_answer.split()) > 12 else 'I appreciate that. '
+    return {'reply': reaction + question, 'done':False}
+
 @app.post('/api/interview/score')
 def interview_score(b: InterviewScore):
-    base=min(95,45+10*sum(x.get('role')=='user' for x in b.history)); f={'technical':base,'hr':base,'soft_skills':min(95,base+3),'feedback':'Good structure and relevant examples; add measurable outcomes.'}; r=llm_json('Return JSON technical, hr, soft_skills integers 0-100 and short feedback.',str(b.history),f); return {k:r.get(k,f[k]) for k in f}
+    fallback = score_interview_fallback(b.history, b.target_role)
+    r=llm_json('Return JSON technical, hr, soft_skills integers 0-100 and 2-3 sentence feedback grounded in the interview history.',str({'target_role':b.target_role,'history':b.history}),fallback)
+    return {k:r.get(k,fallback[k]) for k in fallback}
+
+def score_interview_fallback(history: List[Dict[str, str]], target_role: str) -> Dict[str, Any]:
+    answers = [str(message.get('content','')).strip() for message in history if message.get('role') == 'user' and str(message.get('content','')).strip()]
+    joined = ' '.join(answers)
+    words = re.findall(r"[A-Za-z0-9+#.]+", joined.lower())
+    technical_terms = ['api','database','sql','python','javascript','react','docker','cloud','model','training','validation','pipeline','latency','cache','test','deploy','deployment','algorithm','query','endpoint','service','frontend','backend','metric','security','error','performance','data','schema','git','kubernetes']
+    technical_hits = sum(bool(re.search(r'(?<!\w)'+re.escape(term)+r'(?!\w)', joined, re.I)) for term in technical_terms)
+    structure_hits = sum(bool(re.search(r'\b(?:because|for example|for instance|first|then|finally|result|therefore|so that|measured|improved|reduced|increased)\b', answer, re.I)) for answer in answers)
+    number_hits = sum(bool(re.search(r'\b\d+(?:\.\d+)?%?\b', answer)) for answer in answers)
+    length_score = min(100, 35 + round(min(len(words), 220) * 0.27))
+    coverage = min(100, 38 + 13 * len(answers))
+    technical = round(max(0, min(100, 0.48*length_score + 0.36*min(100,technical_hits*12) + 0.16*coverage)))
+    hr = round(max(0, min(100, 0.43*length_score + 0.34*min(100,structure_hits*22) + 0.23*min(100,number_hits*30))))
+    soft = round(max(0, min(100, 0.38*length_score + 0.38*min(100,structure_hits*22) + 0.24*coverage)))
+    lowered = joined.lower()
+    strengths = []
+    if technical_hits:
+        matched = [term for term in technical_terms if re.search(r'(?<!\w)'+re.escape(term)+r'(?!\w)', joined, re.I)]
+        strengths.append('You grounded your answers in technical details such as ' + ', '.join(matched[:3]))
+    if structure_hits:
+        strengths.append('You explained your reasoning with examples or cause and effect')
+    if number_hits:
+        strengths.append('You included measurable outcomes')
+    if not strengths:
+        strengths.append('You completed ' + str(len(answers)) + ' answer' + ('' if len(answers)==1 else 's'))
+    gaps = []
+    if not structure_hits:
+        gaps.append('add a concrete example and explain the result')
+    if not number_hits:
+        gaps.append('include a number or specific impact where possible')
+    if not technical_hits:
+        gaps.append('name the tools, trade-offs, or technical steps you used')
+    if len(strengths) > 1:
+        first = strengths[0].rstrip('.') + '; ' + strengths[1][0].lower() + strengths[1][1:] + '.'
+    else:
+        first = strengths[0].rstrip('.') + '.'
+    second = ('To strengthen your responses, ' + ' and '.join(gaps[:2]) + '.') if gaps else 'Keep linking your decisions to their impact and the role.'
+    return {'technical':technical,'hr':hr,'soft_skills':soft,'feedback':first+' '+second}
 
 @app.post('/api/readiness')
 def readiness(b: Readiness):
-    iv=sum(b.interview.get(k,0) for k in ['technical','hr','soft_skills'])/3; score=round(b.match_score*.35+b.test_score*.3+iv*.35); gaps=[{'skill':s,'level':max(20,100-min(score,80))} for s in b.missing_skills]; path=[{'step':f'Master {s}','resource':f'Guided {s} fundamentals and hands-on exercises'} for s in b.missing_skills[:4]]
-    extras=['Build a portfolio project','Take a timed assessment','Practice mock interviews','Apply to matched roles']; path += [{'step':x,'resource':'SkillBridge recommended practice plan'} for x in extras[:max(0,4-len(path))]]; return {'readiness_score':score,'skill_gaps':gaps,'learning_path':path[:5]}
+    return readiness_fallback(b.match_score, b.test_score, b.interview, b.missing_skills)
+
+RESOURCE_MAP = {
+    'python': 'Python tutorial: https://docs.python.org/3/tutorial/',
+    'javascript': 'JavaScript guide: https://developer.mozilla.org/en-US/docs/Web/JavaScript/Guide',
+    'typescript': 'TypeScript handbook: https://www.typescriptlang.org/docs/handbook/intro.html',
+    'react': 'React Learn: https://react.dev/learn',
+    'html': 'freeCodeCamp Responsive Web Design: https://www.freecodecamp.org/learn/2022/responsive-web-design/',
+    'css': 'MDN CSS: https://developer.mozilla.org/en-US/docs/Learn/CSS',
+    'sql': 'SQLBolt interactive lessons: https://sqlbolt.com/',
+    'git': 'Git book: https://git-scm.com/book/en/v2',
+    'docker': 'Docker Get Started: https://docs.docker.com/get-started/',
+    'fastapi': 'FastAPI tutorial: https://fastapi.tiangolo.com/tutorial/',
+    'node.js': 'Node.js Learn: https://nodejs.org/en/learn',
+    'java': 'Dev.java learning paths: https://dev.java/learn/',
+    'machine learning': 'Google Machine Learning Crash Course: https://developers.google.com/machine-learning/crash-course',
+    'data structures': 'VisuAlgo data structure visualizations: https://visualgo.net/en',
+    'kubernetes': 'Kubernetes basics: https://kubernetes.io/docs/tutorials/kubernetes-basics/',
+    'aws': 'AWS Skill Builder: https://skillbuilder.aws/',
+    'linux': 'Linux Journey: https://linuxjourney.com/',
+    'statistics': 'Khan Academy Statistics: https://www.khanacademy.org/math/statistics-probability',
+    'pandas': 'Pandas getting started: https://pandas.pydata.org/docs/getting_started/',
+    'rest apis': 'MDN HTTP overview: https://developer.mozilla.org/en-US/docs/Web/HTTP/Overview',
+}
+
+def readiness_fallback(match_score: int, test_score: int, interview: Dict[str, int], missing_skills: List[str]) -> Dict[str, Any]:
+    interview_avg = sum(int(interview.get(key, 0)) for key in ('technical','hr','soft_skills')) / 3
+    score = round(0.35*match_score + 0.30*test_score + 0.35*interview_avg)
+    gaps = [{'skill':skill,'level':max(0,min(100,100-score))} for skill in missing_skills]
+    path = []
+    for skill in missing_skills[:5]:
+        resource = RESOURCE_MAP.get(skill.casefold(), f'Search the {skill} learning path: https://roadmap.sh/ (choose the closest topic roadmap)')
+        path.append({'step':f'Study {skill} fundamentals and practice a small task','resource':resource})
+    return {'readiness_score':score,'skill_gaps':gaps,'learning_path':path}
 
 jobs=[{'id':'job-1','company':'TCS','role':'Software Engineer','required_skills':['Python','SQL','Git']},{'id':'job-2','company':'Infosys','role':'Frontend Developer','required_skills':['JavaScript','React','HTML','CSS']},{'id':'job-3','company':'Razorpay','role':'Backend Engineer','required_skills':['Python','FastAPI','SQL','Docker']},{'id':'job-4','company':'Deloitte','role':'Data Analyst','required_skills':['Python','SQL','Excel','Statistics']},{'id':'job-5','company':'Wipro','role':'Graduate Engineer','required_skills':['Java','SQL','Git']}]
 names=['Aarav Sharma','Ananya Iyer','Rohan Verma','Diya Nair','Arjun Rao','Meera Singh','Kabir Shah','Ishita Patel','Vivek Kumar','Saanvi Das','Aditya Menon','Tara Kapoor','Nikhil Jain','Pooja Reddy','Karan Gupta']
