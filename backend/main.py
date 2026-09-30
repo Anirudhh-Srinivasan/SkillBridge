@@ -17,6 +17,10 @@ MODEL_ORDER = list(dict.fromkeys(m.strip() for m in [os.getenv('GROQ_MODEL'), 'o
 ACTIVE_MODEL = None
 LLM_POOL = ThreadPoolExecutor(max_workers=4)
 logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
+if not logger.handlers:
+    logger.addHandler(logging.StreamHandler())
+logger.propagate = False
 app = FastAPI(title='SkillBridge API')
 app.add_middleware(CORSMiddleware, allow_origins=['*'], allow_credentials=False, allow_methods=['*'], allow_headers=['*'])
 try:
