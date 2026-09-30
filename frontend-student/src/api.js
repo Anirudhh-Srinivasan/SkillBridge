@@ -1,5 +1,6 @@
 // Toggle this locally or set VITE_USE_MOCK=false to connect to FastAPI.
-export const USE_MOCK = import.meta.env.VITE_USE_MOCK !== undefined ? import.meta.env.VITE_USE_MOCK === 'true' : true
+const queryMock = new URLSearchParams(window.location.search).get('mock') === '1'
+export const USE_MOCK = queryMock || import.meta.env.VITE_USE_MOCK === 'true'
 const BASE = import.meta.env.VITE_API_URL || 'http://localhost:8000/api'
 const delay = (v) => new Promise(r => setTimeout(() => r(v), 450 + Math.random() * 400))
 const questions = [

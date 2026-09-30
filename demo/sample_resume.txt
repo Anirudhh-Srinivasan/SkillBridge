@@ -1,0 +1,36 @@
+Aarav Sharma
+Chennai, Tamil Nadu | aarav.sharma@example.com | +91 98765 43210 | github.com/aaravsharma-dev
+
+EDUCATION
+B.Tech, Computer Science and Engineering — SRM Institute of Science and Technology, Chennai
+2025–2029 | Second year | CGPA: 8.6/10
+
+TECHNICAL SKILLS
+Python, JavaScript, React, FastAPI, SQL, SQLite, Git, GitHub, HTML, CSS, REST APIs
+
+PROJECTS
+CampusConnect — Student Event Portal | React, FastAPI, SQLite
+• Built a responsive portal for students to discover campus events and register online.
+• Created REST API endpoints for event listings and registrations; stored records in SQLite.
+• Used Git feature branches and pull requests to coordinate a four-person course team.
+
+StudyBuddy — Collaborative Study Planner | Python, FastAPI, React
+• Developed a weekly study planner with task creation, due dates, and progress tracking.
+• Added request validation and clear error responses to FastAPI routes.
+• Interviewed 12 classmates and iterated on the interface based on their feedback.
+
+SQL Practice Tracker | Python, SQL
+• Designed relational tables for practice questions, topics, and completion history.
+• Wrote joins and aggregate queries to summarize progress by topic.
+
+EXPERIENCE & ACTIVITIES
+Student Developer, CSE Project Lab | Jan 2026–Present
+• Work with classmates in weekly project reviews and explain implementation choices.
+• Completed introductory coursework in data structures, object-oriented programming, and databases.
+
+ACHIEVEMENTS
+• Finalist, department mini hackathon (2026), for CampusConnect.
+• 120+ problems solved across introductory Python and SQL practice tracks.
+
+INTERESTS
+Backend development, developer tools, badminton, and peer mentoring.

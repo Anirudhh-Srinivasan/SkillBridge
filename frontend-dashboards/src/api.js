@@ -1,6 +1,6 @@
 const API_BASE = import.meta.env.VITE_API_URL || 'http://localhost:8000/api'
-const envMock = import.meta.env.VITE_USE_MOCK
-export const USE_MOCK = envMock == null ? true : envMock.toLowerCase() !== 'false'
+const queryMock = new URLSearchParams(window.location.search).get('mock') === '1'
+export const USE_MOCK = queryMock || import.meta.env.VITE_USE_MOCK === 'true'
 
 const jobsMock = [
   { id: 'job-1', company: 'Razorpay', role: 'Frontend Engineer', required_skills: ['React', 'JavaScript', 'TypeScript', 'CSS', 'Accessibility'] },
@@ -62,4 +62,3 @@ export async function postJob(payload) {
   if (USE_MOCK) { await delay(350); const job = { id: `job-${Date.now()}`, ...payload }; jobsMock.unshift(job); return job }
   return request('/jobs', { method: 'POST', body: JSON.stringify(payload) })
 }
-
