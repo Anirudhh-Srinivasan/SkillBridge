@@ -6,6 +6,8 @@ from fastapi import FastAPI, File, Form, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from pypdf import PdfReader
+from question_bank import QUESTION_BANK
+import random
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 load_dotenv(os.path.join(BASE_DIR, '.env'))
@@ -66,10 +68,79 @@ class InterviewScore(BaseModel): history: List[Dict[str,str]]; target_role: str
 class Readiness(BaseModel): match_score: int; test_score: int; interview: Dict[str,int]; missing_skills: List[str]
 class Job(BaseModel): company: str; role: str; required_skills: List[str]
 
+def build_bank_fallback(skills: List[str]) -> List[Dict[str, Any]]:
+    """Select ten balanced bank questions, using nearby or general bank skills as needed."""
+    requested = [str(skill).strip() for skill in skills if str(skill).strip()] or ['Python']
+    bank_names = list(QUESTION_BANK)
+    by_lower = {name.lower(): name for name in bank_names}
+    canonical = []
+    for skill in requested:
+        # HTML and CSS are both represented by the combined HTML/CSS bank.
+        key = skill.lower()
+        if key in ('html', 'css'):
+            match = 'HTML/CSS'
+        else:
+            match = by_lower.get(key)
+        if match and match not in canonical:
+            canonical.append(match)
+
+    # Unknown skills borrow questions from the nearest bank topic where possible;
+    # otherwise every bank skill is eligible as a balanced source.
+    aliases = {
+        'rust': 'Java', 'typescript': 'JavaScript', 'vue': 'React', 'angular': 'JavaScript',
+        'postgresql': 'SQL', 'mysql': 'SQL', 'database': 'SQL', 'api': 'FastAPI',
+        'backend': 'FastAPI', 'express': 'Node.js', 'containers': 'Docker',
+        'algorithms': 'Data Structures', 'statistics': 'Machine Learning',
+        'web development': 'HTML/CSS', 'css': 'HTML/CSS', 'html': 'HTML/CSS',
+    }
+    source_for = {}
+    unsupported = []
+    for skill in requested:
+        key = skill.lower()
+        source_for[skill] = by_lower.get(key) or (aliases.get(key) and by_lower.get(aliases[key]))
+        if source_for[skill] is None:
+            unsupported.append(skill)
+    sources = list(dict.fromkeys(canonical + [source for source in source_for.values() if source]))
+    if not sources:
+        sources = bank_names[:]
+    for index, skill in enumerate(unsupported):
+        source_for[skill] = None
+
+    # Divide ten slots as evenly as possible among requested skills. If a skill
+    # has no direct bank, fill its allocation from the nearest available topic.
+    selected = []
+    used = {name: set() for name in bank_names}
+    for index in range(10):
+        requested_skill = requested[index % len(requested)]
+        source = source_for.get(requested_skill)
+        if source is None:
+            source = bank_names[index % len(bank_names)]
+        candidates = [q for q in QUESTION_BANK[source] if q['question'] not in used[source]]
+        if not candidates:
+            candidates = [q for bank_name in sources for q in QUESTION_BANK[bank_name]
+                          if q['question'] not in used[bank_name]]
+            if not candidates:
+                candidates = [q for bank_name in bank_names for q in QUESTION_BANK[bank_name]]
+        question = random.choice(candidates)
+        actual_source = next(name for name in bank_names if question in QUESTION_BANK[name])
+        used[actual_source].add(question['question'])
+        selected.append({
+            'id': len(selected) + 1,
+            'question': question['question'],
+            'options': list(question['options']),
+            'answer_index': question['answer_index'],
+            'skill': requested_skill if requested_skill not in unsupported else actual_source,
+        })
+    random.shuffle(selected)
+    for index, question in enumerate(selected, start=1):
+        question['id'] = index
+    return selected
+
 @app.post('/api/test/generate')
 def generate_test(b: TestGenerate):
-    ss=b.skills or ['Python']; qs=[{'id':i+1,'question':f'Which statement best describes {ss[i%len(ss)]}?','options':[f'Core {ss[i%len(ss)]} concept','A database brand','A hardware part','An unrelated protocol'],'answer_index':0,'skill':ss[i%len(ss)]} for i in range(10)]
-    r=llm_json('Return JSON with exactly 10 MCQs, each with id, question, four options, answer_index, skill.',str(ss),{'questions':qs}); return {'questions':r.get('questions',qs)[:10]}
+    qs=build_bank_fallback(b.skills)
+    skills=b.skills or ['Python']
+    r=llm_json('Return JSON with exactly 10 MCQs, each with id, question, four options, answer_index, skill.',str(skills),{'questions':qs}); return {'questions':r.get('questions',qs)[:10]}
 
 @app.post('/api/test/submit')
 def submit_test(b: TestSubmit):
