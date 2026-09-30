@@ -13,18 +13,21 @@ import random
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 load_dotenv(os.path.join(BASE_DIR, '.env'))
-MODEL_ORDER = list(dict.fromkeys([m for m in [os.getenv('GROQ_MODEL'), 'openai/gpt-oss-20b', 'openai/gpt-oss-120b', 'qwen/qwen3.8-27b'] if m]))
+MODEL_ORDER = list(dict.fromkeys(m.strip() for m in [os.getenv('GROQ_MODEL'), 'llama-3.3-70b-versatile', 'llama-3.1-8b-instant', 'openai/gpt-oss-20b'] if m and m.strip()))
+if os.getenv('GROQ_MODEL') and 'qwen' in os.getenv('GROQ_MODEL').lower():
+    MODEL_ORDER = list(dict.fromkeys(['llama-3.3-70b-versatile', 'llama-3.1-8b-instant', 'openai/gpt-oss-20b']))
 ACTIVE_MODEL = None
 LLM_POOL = ThreadPoolExecutor(max_workers=4)
 logger = logging.getLogger(__name__)
 app = FastAPI(title='SkillBridge API')
 app.add_middleware(CORSMiddleware, allow_origins=['*'], allow_credentials=False, allow_methods=['*'], allow_headers=['*'])
 try:
-    from groq import Groq
+    from groq import Groq, RateLimitError
     client = Groq(api_key=os.getenv('GROQ_API_KEY')) if os.getenv('GROQ_API_KEY') else None
 except Exception:
     logger.exception('Failed to initialize Groq client')
     client = None
+    RateLimitError = ()
 
 logger.info('SkillBridge LLM active model: %s', os.getenv('GROQ_MODEL') or MODEL_ORDER[0])
 
@@ -48,16 +51,23 @@ async def unexpected_error_handler(request: Request, exc: Exception):
 def _valid_payload(value: Any, validator: Optional[Any]) -> bool:
     return isinstance(value, dict) and (validator(value) if validator else True)
 
-def llm_json(system: str, prompt: str, fallback: Dict[str, Any], validator: Optional[Any] = None) -> Dict[str, Any]:
+def _json_shape(value: Any) -> str:
+    if isinstance(value, dict):
+        return f"dict keys={list(value)[:30]}"
+    return type(value).__name__
+
+def llm_json(system: str, prompt: str, fallback: Dict[str, Any], validator: Optional[Any] = None,
+             normalizer: Optional[Any] = None) -> Dict[str, Any]:
     """Call Groq with bounded retries, route validation and a cached working model."""
     global ACTIVE_MODEL
     if not client:
         return fallback
     models = ([ACTIVE_MODEL] if ACTIVE_MODEL else []) + [m for m in MODEL_ORDER if m != ACTIVE_MODEL]
+    failed_models = []
     for model in models:
         future = None
         try:
-            future = LLM_POOL.submit(client.chat.completions.create, model=model, temperature=0.2, max_tokens=4000, timeout=20,
+            future = LLM_POOL.submit(client.chat.completions.create, model=model, temperature=0.2, max_tokens=1500, timeout=20,
                 messages=[{'role':'system','content':system},{'role':'user','content':prompt}])
             response = future.result(timeout=20)
             content = response.choices[0].message.content
@@ -70,15 +80,26 @@ def llm_json(system: str, prompt: str, fallback: Dict[str, Any], validator: Opti
             if starts and end > min(starts):
                 raw = raw[min(starts):end + 1]
             parsed = json.loads(raw)
+            original_shape = _json_shape(parsed)
+            if normalizer:
+                parsed = normalizer(parsed)
             if not _valid_payload(parsed, validator):
+                logger.error('LLM route contract validation failed; raw model text (first 1500 chars)=%r; parsed JSON type/keys=%s; normalized type/keys=%s',
+                             content[:1500], original_shape, _json_shape(parsed))
                 raise ValueError('LLM JSON failed route contract validation')
             ACTIVE_MODEL = model
             logger.info('LLM request succeeded using model %s', model)
             return parsed
-        except Exception:
-            if isinstance(__import__('sys').exc_info()[1], FutureTimeout) and future is not None:
+        except Exception as exc:
+            failed_models.append(model)
+            if isinstance(exc, FutureTimeout) and future is not None:
                 future.cancel()
-            logger.error('LLM request failed using model %s\n%s', model, traceback.format_exc())
+            if RateLimitError and isinstance(exc, RateLimitError):
+                logger.warning('Groq rate limit for model %s; skipping to next model', model)
+            else:
+                logger.error('LLM request failed using model %s\n%s', model, traceback.format_exc())
+    if failed_models:
+        logger.warning('All LLM models failed; falling back to question bank. Failed models: %s', ', '.join(failed_models))
     return fallback
 
 def file_text(data: bytes, name: str) -> str:
@@ -142,10 +163,114 @@ def extract_resume_fallback(text: str, target_role: str) -> Dict[str, Any]:
 @app.get('/api/health')
 def health(): return {'status':'ok'}
 
-def _resume_valid(x): return isinstance(x.get('name'), str) and isinstance(x.get('skills'), list) and all(isinstance(v,str) for v in x['skills'])
-def _questions_valid(x):
+def _as_list_of_strings(value):
+    if isinstance(value, str):
+        return [item.strip() for item in re.split(r'[,;\n]', value) if item.strip()]
+    if isinstance(value, list):
+        return [str(item).strip() for item in value if item is not None and str(item).strip()]
+    return []
+
+def _to_int(value):
+    if isinstance(value, bool): return None
+    if isinstance(value, int): return value
+    if isinstance(value, float): return int(value) if value.is_integer() else None
+    if isinstance(value, str):
+        match = re.search(r'-?\d+', value.strip())
+        return int(match.group()) if match else None
+    return None
+
+def _bounded_int(value, low=0, high=100):
+    number = _to_int(value)
+    return max(low, min(high, number)) if number is not None else None
+
+def _resume_normalize(value):
+    if not isinstance(value, dict): return value
+    name = value.get('name', 'Student')
+    if isinstance(name, list): name = ' '.join(str(part) for part in name)
+    if not isinstance(name, str): name = str(name)
+    result = {'name': name.strip() or 'Student', 'skills': _as_list_of_strings(value.get('skills')),
+              'missing_skills': _as_list_of_strings(value.get('missing_skills'))}
+    score = _bounded_int(value.get('match_score'))
+    if score is not None: result['match_score'] = score
+    return result
+
+def _resume_valid(x): return isinstance(x.get('name'), str) and isinstance(x.get('skills'), list) and all(isinstance(v,str) for v in x['skills']) and isinstance(x.get('missing_skills'),list) and isinstance(x.get('match_score'),int) and 0<=x['match_score']<=100
+
+def _question_list(value):
+    if isinstance(value, list): return value
+    if isinstance(value, dict):
+        for key in ('questions','mcqs','quiz','items'):
+            if isinstance(value.get(key), list): return value[key]
+    return None
+
+def _question_normalizer(skills, fallback_questions, target_count=10):
+    requested = [str(skill).strip() for skill in skills if str(skill).strip()] or ['Python']
+    requested_lower = {skill.casefold(): skill for skill in requested}
+    def normalize(value):
+        questions = _question_list(value)
+        if questions is None: return value
+        normalized = []
+        numeric_answer_indexes = []
+        one_based_indexes = []
+        for item in questions:
+            if not isinstance(item, dict): continue
+            question = next((item.get(key) for key in ('question','q','text') if isinstance(item.get(key), str) and item[key].strip()), None)
+            options = next((item.get(key) for key in ('options','choices','answers') if isinstance(item.get(key), list)), None)
+            if not question or not options: continue
+            choices = [entry.strip() for entry in options if isinstance(entry, str) and entry.strip()][:4]
+            if len(choices) != 4: continue
+            answer_key = next((key for key in ('answer_index','answer','correct','correct_index','correct_answer') if key in item), None)
+            answer = item.get(answer_key) if answer_key else None
+            is_letter_answer = isinstance(answer, str) and answer.strip().upper() in ('A','B','C','D')
+            numeric_answer_indexes.append(answer_key == 'answer_index' and isinstance(answer,str) and bool(re.fullmatch(r'\s*\d+\s*', answer)))
+            one_based_indexes.append(answer_key != 'answer_index' and not is_letter_answer)
+            if isinstance(answer, str):
+                stripped = answer.strip()
+                if stripped.upper() in ('A','B','C','D'): answer = ord(stripped.upper()) - ord('A')
+                elif stripped in choices: answer = choices.index(stripped)
+                else: answer = _to_int(stripped)
+            else: answer = _to_int(answer)
+            skill = item.get('skill')
+            if not isinstance(skill, str) or skill.casefold() not in requested_lower:
+                skill = requested[len(normalized) % len(requested)]
+            normalized.append({'id':len(normalized)+1,'question':question.strip(),'options':choices,'answer_index':answer,'skill':skill})
+            if len(normalized) == target_count: break
+        answers = [q['answer_index'] for q in normalized]
+        if answers and all(isinstance(answer,int) and 1 <= answer <= 4 for answer in answers) and not any(numeric_answer_indexes) and all(one_based_indexes):
+            for q in normalized: q['answer_index'] -= 1
+        normalized = [q for q in normalized if isinstance(q['answer_index'], int) and 0 <= q['answer_index'] < 4]
+        for index, question in enumerate(normalized, 1): question['id'] = index
+        if len(normalized) < target_count:
+            needed = target_count - len(normalized)
+            normalized.extend(dict(q) for q in fallback_questions[:needed])
+        for index, question in enumerate(normalized[:target_count], 1): question['id'] = index
+        return {'questions': normalized[:target_count]}
+    return normalize
+
+def _questions_valid(x, expected_count=10):
     qs=x.get('questions')
-    return isinstance(qs,list) and len(qs)==10 and all(isinstance(q,dict) and isinstance(q.get('id'),(int,str)) and isinstance(q.get('question'),str) and isinstance(q.get('skill'),str) and isinstance(q.get('options'),list) and len(q['options'])==4 and all(isinstance(o,str) for o in q['options']) and isinstance(q.get('answer_index'),int) and 0<=q['answer_index']<4 for q in qs)
+    return isinstance(qs,list) and len(qs)==expected_count and all(isinstance(q,dict) and isinstance(q.get('id'),(int,str)) and isinstance(q.get('question'),str) and isinstance(q.get('skill'),str) and isinstance(q.get('options'),list) and len(q['options'])==4 and all(isinstance(o,str) for o in q['options']) and isinstance(q.get('answer_index'),int) and 0<=q['answer_index']<4 for q in qs)
+
+def _to_bool(value):
+    if isinstance(value, bool): return value
+    if isinstance(value, (int,float)): return bool(value)
+    if isinstance(value, str):
+        if value.strip().casefold() in ('true','yes','1','done','complete'): return True
+        if value.strip().casefold() in ('false','no','0','not done','incomplete'): return False
+    return None
+
+def _next_normalize(value):
+    if not isinstance(value, dict): return value
+    reply = next((value.get(key) for key in ('reply','message','question','text') if isinstance(value.get(key),str)), None)
+    return {'reply':reply,'done':_to_bool(value.get('done'))}
+
+def _score_normalize(value):
+    if not isinstance(value, dict): return value
+    result = {key:_bounded_int(value.get(key)) for key in ('technical','hr','soft_skills')}
+    feedback = value.get('feedback', '')
+    result['feedback'] = feedback if isinstance(feedback,str) else json.dumps(feedback, ensure_ascii=False)
+    return result
+
 def _next_valid(x): return isinstance(x.get('reply'),str) and bool(x['reply'].strip()) and isinstance(x.get('done'),bool)
 def _score_valid(x): return all(isinstance(x.get(k),int) and 0<=x[k]<=100 for k in ('technical','hr','soft_skills')) and isinstance(x.get('feedback'),str)
 
@@ -153,7 +278,10 @@ def _score_valid(x): return all(isinstance(x.get(k),int) and 0<=x[k]<=100 for k 
 async def parse_resume(file: UploadFile = File(...), target_role: str = Form(...)):
     text = file_text(await file.read(), file.filename or 'resume.txt')
     fallback = extract_resume_fallback(text, target_role)
-    parsed = llm_json('Extract only JSON with name and skills array.', text[:10000], {'name':fallback['name'],'skills':fallback['skills']}, _resume_valid)
+    resume_fallback = {'name':fallback['name'],'skills':fallback['skills'],'missing_skills':fallback['missing_skills'],'match_score':fallback['match_score']}
+    contract = {'name':'Jane Doe','skills':['Python','SQL'],'missing_skills':['Docker'],'match_score':67}
+    system = f'Extract resume details. Output ONLY valid JSON in exactly this API_CONTRACT.md shape: {json.dumps(contract)}. No markdown or explanation. Skills and missing_skills must be arrays of strings; match_score is an integer 0-100.'
+    parsed = llm_json(system, text[:10000], resume_fallback, _resume_valid, _resume_normalize)
     # Keep the deterministic role comparison and use LLM extraction only when it
     # returned a valid skill list; the fallback path always uses the keyword bank.
     skills = [str(x) for x in parsed.get('skills', fallback['skills'])] if isinstance(parsed.get('skills', fallback['skills']), list) else fallback['skills']
@@ -244,7 +372,17 @@ def build_bank_fallback(skills: List[str]) -> List[Dict[str, Any]]:
 def generate_test(b: TestGenerate):
     qs=build_bank_fallback(b.skills)
     skills=b.skills or ['Python']
-    r=llm_json('Return JSON with exactly 10 MCQs, each with id, question, four options, answer_index, skill.',str(skills),{'questions':qs}, _questions_valid); return {'questions':r['questions']}
+    examples = [{'id':i,'question':f'Example question {i}?','options':['Option A','Option B','Option C','Option D'],'answer_index':0,'skill':skills[(i-1) % len(skills)]} for i in range(1,6)]
+    system = f'Generate exactly 5 multiple choice questions for these skills. Output ONLY valid JSON in exactly this shape: {json.dumps({"questions":examples})}. No markdown or explanation. answer_index is a 0-based integer; every options array has exactly 4 non-empty strings.'
+    generated = []
+    for batch in range(2):
+        fallback_batch = qs[batch * 5:(batch + 1) * 5]
+        result = llm_json(system, str(skills), {'questions':fallback_batch},
+                          lambda value: _questions_valid(value, 5),
+                          _question_normalizer(skills, fallback_batch, 5))
+        generated.extend(result['questions'])
+    for index, question in enumerate(generated, 1): question['id'] = index
+    return {'questions':generated}
 
 @app.post('/api/test/submit')
 def submit_test(b: TestSubmit):
@@ -256,7 +394,9 @@ def submit_test(b: TestSubmit):
 @app.post('/api/interview/next')
 def interview_next(b: InterviewNext):
     fallback = interview_next_fallback(b.type, b.target_role, b.history)
-    result=llm_json('Return a JSON object with reply (one concise interview question) and done (boolean). Tailor it to the interview type and target role, use the history to avoid repeating questions, and set done=true only after five candidate answers.',json.dumps({'type':b.type,'target_role':b.target_role,'history':b.history}),fallback, _next_valid)
+    example = {'reply':'How would you diagnose a slow request in a backend service?','done':False}
+    system = f'Tailor the next interview question to the type and target role. Output ONLY valid JSON in exactly this API_CONTRACT.md shape: {json.dumps(example)}. No markdown or explanation. Set done=true only after five candidate answers.'
+    result=llm_json(system,json.dumps({'type':b.type,'target_role':b.target_role,'history':b.history}),fallback, _next_valid, _next_normalize)
     return {'reply':str(result.get('reply',fallback['reply'])),'done':bool(result.get('done',fallback['done']))}
 
 TECH_INTERVIEW_BANK = [
@@ -311,7 +451,9 @@ def interview_next_fallback(interview_type: str, target_role: str, history: List
 @app.post('/api/interview/score')
 def interview_score(b: InterviewScore):
     fallback = score_interview_fallback(b.history, b.target_role)
-    r=llm_json('Return JSON technical, hr, soft_skills integers 0-100 and 2-3 sentence feedback grounded in the interview history.',str({'target_role':b.target_role,'history':b.history}),fallback, _score_valid)
+    example = {'technical':78,'hr':82,'soft_skills':75,'feedback':'You explained your decisions clearly. Add a measurable result to strengthen your examples.'}
+    system = f'Score the interview using the history. Output ONLY valid JSON in exactly this API_CONTRACT.md shape: {json.dumps(example)}. No markdown or explanation. Scores are integers 0-100.'
+    r=llm_json(system,str({'target_role':b.target_role,'history':b.history}),fallback, _score_valid, _score_normalize)
     return {k:r.get(k,fallback[k]) for k in fallback}
 
 def score_interview_fallback(history: List[Dict[str, str]], target_role: str) -> Dict[str, Any]:
@@ -358,7 +500,33 @@ def readiness(b: Readiness):
     prompt=json.dumps({'match_score':b.match_score,'test_score':b.test_score,'interview':b.interview,'missing_skills':b.missing_skills})
     def valid(x):
         return isinstance(x.get('readiness_score'),int) and 0<=x['readiness_score']<=100 and isinstance(x.get('skill_gaps'),list) and all(isinstance(g,dict) and isinstance(g.get('skill'),str) and isinstance(g.get('level'),int) for g in x['skill_gaps']) and isinstance(x.get('learning_path'),list) and all(isinstance(p,dict) and isinstance(p.get('step'),str) and isinstance(p.get('resource'),str) for p in x['learning_path'])
-    return llm_json('Return JSON with readiness_score integer 0-100, skill_gaps array of {skill,level}, and learning_path array of {step,resource}.',prompt,fallback,valid)
+    example = {'readiness_score':72,'skill_gaps':[{'skill':'Docker','level':45}],'learning_path':[{'step':'Practice building a containerized API','resource':'Docker Get Started'}]}
+    system = f'Assess readiness. Output ONLY valid JSON in exactly this API_CONTRACT.md shape: {json.dumps(example)}. No markdown or explanation. readiness_score and skill_gaps.level are integers 0-100.'
+    return llm_json(system,prompt,fallback,valid,_readiness_normalize)
+
+def _readiness_normalize(value):
+    if not isinstance(value, dict): return value
+    readiness_score = _bounded_int(value.get('readiness_score'))
+    gaps = value.get('skill_gaps', [])
+    if isinstance(gaps, dict): gaps = [{'skill':k,'level':v} for k,v in gaps.items()]
+    if isinstance(gaps, str): gaps = [g.strip() for g in gaps.split(',') if g.strip()]
+    normalized_gaps = []
+    if isinstance(gaps,list):
+        for gap in gaps:
+            if isinstance(gap,str): gap={'skill':gap,'level':0}
+            if isinstance(gap,dict) and isinstance(gap.get('skill'),str):
+                level = _bounded_int(gap.get('level'))
+                if level is not None: normalized_gaps.append({'skill':gap['skill'],'level':level})
+    path = value.get('learning_path', [])
+    if isinstance(path,str): path=[path]
+    normalized_path=[]
+    if isinstance(path,list):
+        for item in path:
+            if isinstance(item,str): item={'step':item,'resource':''}
+            if isinstance(item,dict) and isinstance(item.get('step'),str):
+                resource=item.get('resource','')
+                normalized_path.append({'step':item['step'],'resource':resource if isinstance(resource,str) else str(resource)})
+    return {'readiness_score':readiness_score,'skill_gaps':normalized_gaps,'learning_path':normalized_path}
 
 RESOURCE_MAP = {
     'python': 'Python tutorial: https://docs.python.org/3/tutorial/',
