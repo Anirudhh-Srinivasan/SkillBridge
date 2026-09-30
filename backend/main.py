@@ -299,7 +299,7 @@ class TestGenerate(BaseModel): skills: List[str]
 class TestSubmit(BaseModel): answers: List[Dict[str,Any]]; questions: List[Dict[str,Any]]
 class InterviewNext(BaseModel): type: str; target_role: str; history: List[Dict[str,str]] = []
 class InterviewScore(BaseModel): history: List[Dict[str,str]]; target_role: str
-class Readiness(BaseModel): match_score: int; test_score: int; interview: Dict[str,int]; missing_skills: List[str]
+class Readiness(BaseModel): match_score: int; test_score: int; interview: Dict[str,Any]; missing_skills: List[str]
 class Job(BaseModel): company: str; role: str; required_skills: List[str]
 
 def build_bank_fallback(skills: List[str]) -> List[Dict[str, Any]]:
