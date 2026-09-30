@@ -13,7 +13,7 @@ import random
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 load_dotenv(os.path.join(BASE_DIR, '.env'))
-MODEL_ORDER = list(dict.fromkeys(m.strip() for m in [os.getenv('GROQ_MODEL'), 'openai/gpt-oss-20b'] if m and m.strip()))
+MODEL_ORDER = list(dict.fromkeys([m for m in [os.getenv('GROQ_MODEL'), 'openai/gpt-oss-20b', 'openai/gpt-oss-120b'] if m]))
 ACTIVE_MODEL = None
 LLM_POOL = ThreadPoolExecutor(max_workers=4)
 logger = logging.getLogger(__name__)
@@ -31,7 +31,8 @@ except Exception:
     client = None
     RateLimitError = ()
 
-logger.info('SkillBridge LLM active model: %s', os.getenv('GROQ_MODEL') or MODEL_ORDER[0])
+logger.info('Groq key loaded: %s', 'yes' if os.getenv('GROQ_API_KEY') else 'no')
+logger.info('SkillBridge LLM active model: %s', MODEL_ORDER[0])
 
 @app.exception_handler(Exception)
 async def unexpected_error_handler(request: Request, exc: Exception):
@@ -42,7 +43,7 @@ async def unexpected_error_handler(request: Request, exc: Exception):
     elif path.endswith('/resume/parse'): fallback={'name':'Student','skills':[],'missing_skills':[],'match_score':0}
     elif path.endswith('/test/generate'): fallback={'questions':build_bank_fallback(['Python'])}
     elif path.endswith('/test/submit'): fallback={'score':0,'per_skill':{}}
-    elif path.endswith('/interview/next'): fallback={'reply':'Could you tell me more about your experience?', 'done':False}
+    elif path.endswith('/interview/next'): fallback=interview_next_fallback('technical','backend developer',[])
     elif path.endswith('/interview/score'): fallback={'technical':0,'hr':0,'soft_skills':0,'feedback':'Complete a few answers to receive feedback.'}
     elif path.endswith('/readiness'): fallback=readiness_fallback(0,0,{},[])
     elif path.endswith('/jobs') and request.method=='GET': fallback=[]
@@ -64,14 +65,17 @@ def llm_json(system: str, prompt: str, fallback: Dict[str, Any], validator: Opti
     global ACTIVE_MODEL
     if not client:
         return fallback
-    models = ([ACTIVE_MODEL] if ACTIVE_MODEL else []) + [m for m in MODEL_ORDER if m != ACTIVE_MODEL]
+    models = [m for m in MODEL_ORDER if m != ACTIVE_MODEL]
+    if ACTIVE_MODEL and ACTIVE_MODEL in models:
+        models.remove(ACTIVE_MODEL)
+        models.insert(0, ACTIVE_MODEL)
     failed_models = []
     for model in models:
         future = None
         try:
-            future = LLM_POOL.submit(client.chat.completions.create, model=model, temperature=0.2, max_tokens=1500, timeout=20,
+            future = LLM_POOL.submit(client.chat.completions.create, model=model, temperature=0.2, max_tokens=1500, timeout=8,
                 messages=[{'role':'system','content':system},{'role':'user','content':prompt}])
-            response = future.result(timeout=20)
+            response = future.result(timeout=8)
             content = response.choices[0].message.content
             if not isinstance(content, str) or not content.strip():
                 raise ValueError('LLM returned empty message content')
@@ -86,20 +90,20 @@ def llm_json(system: str, prompt: str, fallback: Dict[str, Any], validator: Opti
             if normalizer:
                 parsed = normalizer(parsed)
             if not _valid_payload(parsed, validator):
-                logger.error('LLM route contract validation failed; raw model text (first 1500 chars)=%r; parsed JSON type/keys=%s; normalized type/keys=%s',
-                             content[:1500], original_shape, _json_shape(parsed))
+                logger.warning('LLM route contract validation failed; parsed JSON type/keys=%s; normalized type/keys=%s',
+                             original_shape, _json_shape(parsed))
                 raise ValueError('LLM JSON failed route contract validation')
             ACTIVE_MODEL = model
             logger.info('LLM request succeeded using model %s', model)
             return parsed
         except Exception as exc:
             failed_models.append(model)
-            if isinstance(exc, FutureTimeout) and future is not None:
+            if isinstance(exc, (FutureTimeout, TimeoutError)) and future is not None:
                 future.cancel()
             if RateLimitError and isinstance(exc, RateLimitError):
                 logger.warning('Groq rate limit for model %s; skipping to next model', model)
             else:
-                logger.error('LLM request failed using model %s\n%s', model, traceback.format_exc())
+                logger.warning('LLM request failed using model %s (%s); using deterministic fallback when models are exhausted', model, type(exc).__name__)
     if failed_models:
         logger.warning('All LLM models failed; falling back to question bank. Failed models: %s', ', '.join(failed_models))
     return fallback
@@ -396,10 +400,7 @@ def submit_test(b: TestSubmit):
 @app.post('/api/interview/next')
 def interview_next(b: InterviewNext):
     fallback = interview_next_fallback(b.type, b.target_role, b.history)
-    example = {'reply':'How would you diagnose a slow request in a backend service?','done':False}
-    system = f'Tailor the next interview question to the type and target role. Output ONLY valid JSON in exactly this API_CONTRACT.md shape: {json.dumps(example)}. No markdown or explanation. Set done=true only after five candidate answers.'
-    result=llm_json(system,json.dumps({'type':b.type,'target_role':b.target_role,'history':b.history}),fallback, _next_valid, _next_normalize)
-    return {'reply':str(result.get('reply',fallback['reply'])),'done':bool(result.get('done',fallback['done']))}
+    return fallback
 
 TECH_INTERVIEW_BANK = [
     'How would you diagnose a slow request in a {role} system, and what measurements would you collect before changing it?',
@@ -417,17 +418,14 @@ HR_INTERVIEW_BANK = [
 ]
 
 def interview_next_fallback(interview_type: str, target_role: str, history: List[Dict[str, str]]) -> Dict[str, Any]:
-    # The frontend marks the technical-to-HR transition in the shared transcript.
-    # Count HR answers from that marker while retaining the full transcript for scoring.
-    round_start = max((i for i, message in enumerate(history)
-                       if message.get('role') == 'assistant' and 'Technical round complete' in message.get('content', '')), default=-1)
-    answered = sum(message.get('role') == 'user' for message in history[round_start + 1:])
-    if answered >= 5:
-        return {'reply':'Thank you for walking me through your examples. That completes our interview.', 'done':True}
+    # The UI sends the active interview round as a separate transcript.
+    answered = sum(message.get('role') == 'user' for message in history)
+    if answered >= 3:
+        return {'reply':'Thank you for walking me through your examples. That completes this round.', 'done':True}
     latest_answer = next((str(message.get('content','')).strip() for message in reversed(history)
                          if message.get('role') == 'user' and str(message.get('content','')).strip()), '')
+    role = target_role.lower()
     if interview_type.lower() == 'technical':
-        role = target_role.lower()
         if 'ml' in role or 'machine learning' in role:
             label = 'machine learning'
         elif 'full stack' in role or 'full-stack' in role:
@@ -442,12 +440,21 @@ def interview_next_fallback(interview_type: str, target_role: str, history: List
             label = 'DevOps environment'
         else:
             label = target_role
-        question = TECH_INTERVIEW_BANK[answered].format(role=label)
     else:
-        question = HR_INTERVIEW_BANK[answered]
+        label = target_role
+    if interview_type.lower() == 'technical':
+        question = TECH_INTERVIEW_BANK[answered % len(TECH_INTERVIEW_BANK)].format(role=label)
+    else:
+        question = HR_INTERVIEW_BANK[answered % len(HR_INTERVIEW_BANK)]
     reaction = ''
     if latest_answer:
         reaction = 'Thanks for explaining that. ' if len(latest_answer.split()) > 12 else 'I appreciate that. '
+    if latest_answer:
+        asked = {str(item.get('content','')) for item in history if item.get('role') == 'assistant'}
+        candidates = TECH_INTERVIEW_BANK if interview_type.lower() == 'technical' else HR_INTERVIEW_BANK
+        candidates = [candidate.format(role=label) if '{role}' in candidate else candidate for candidate in candidates]
+        question = next((candidate for candidate in candidates if candidate not in asked), question)
+        reaction = ''
     return {'reply': reaction + question, 'done':False}
 
 @app.post('/api/interview/score')

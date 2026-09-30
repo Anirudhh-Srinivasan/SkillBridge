@@ -1,6 +1,6 @@
 const API_BASE = import.meta.env.VITE_API_URL || 'http://localhost:8000/api'
 const queryMock = new URLSearchParams(window.location.search).get('mock') === '1'
-export const USE_MOCK = queryMock || import.meta.env.VITE_USE_MOCK === 'true'
+export const USE_MOCK = queryMock || import.meta.env.VITE_USE_MOCK !== 'false'
 
 const jobsMock = [
   { id: 'job-1', company: 'Razorpay', role: 'Frontend Engineer', required_skills: ['React', 'JavaScript', 'TypeScript', 'CSS', 'Accessibility'] },
