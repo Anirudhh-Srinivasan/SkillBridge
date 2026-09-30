@@ -37,9 +37,17 @@ const gapsMock = [
 
 const delay = (ms = 220) => new Promise(resolve => setTimeout(resolve, ms))
 async function request(path, options) {
-  const response = await fetch(`${API_BASE}${path}`, { headers: { 'Content-Type': 'application/json', ...options?.headers }, ...options })
-  if (!response.ok) throw new Error(`Request failed (${response.status})`)
-  return response.json()
+  const controller = new AbortController()
+  const timer = setTimeout(() => controller.abort(), 60000)
+  try {
+    const response = await fetch(`${API_BASE}${path}`, { ...options, signal: controller.signal, headers: { 'Content-Type': 'application/json', ...options?.headers } })
+    if (!response.ok) throw new Error(`Request failed (${response.status})`)
+    return await response.json()
+  } catch (error) {
+    if (error.name === 'AbortError') throw new Error('This is taking longer than expected. Please try again.')
+    if (!navigator.onLine) throw new Error('You appear to be offline. Check your connection and try again.')
+    throw new Error(error.message || 'We couldn’t load this data. Please try again.')
+  } finally { clearTimeout(timer) }
 }
 
 export async function getJobs() { if (USE_MOCK) { await delay(); return jobsMock } return request('/jobs') }

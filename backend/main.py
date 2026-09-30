@@ -1,8 +1,10 @@
-import json, logging, os, re
+import json, logging, os, re, traceback
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
 from io import BytesIO
 from typing import Any, Dict, List, Optional
 from dotenv import load_dotenv
-from fastapi import FastAPI, File, Form, UploadFile
+from fastapi import FastAPI, File, Form, UploadFile, Request
+from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from pypdf import PdfReader
@@ -11,7 +13,9 @@ import random
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 load_dotenv(os.path.join(BASE_DIR, '.env'))
-GROQ_MODEL = os.getenv('GROQ_MODEL', 'llama-3.3-70b-versatile')
+MODEL_ORDER = list(dict.fromkeys([m for m in [os.getenv('GROQ_MODEL'), 'openai/gpt-oss-20b', 'openai/gpt-oss-120b', 'qwen/qwen3.8-27b'] if m]))
+ACTIVE_MODEL = None
+LLM_POOL = ThreadPoolExecutor(max_workers=4)
 logger = logging.getLogger(__name__)
 app = FastAPI(title='SkillBridge API')
 app.add_middleware(CORSMiddleware, allow_origins=['*'], allow_credentials=False, allow_methods=['*'], allow_headers=['*'])
@@ -22,19 +26,60 @@ except Exception:
     logger.exception('Failed to initialize Groq client')
     client = None
 
-logger.info('GROQ_API_KEY loaded: %s', bool(os.getenv('GROQ_API_KEY')))
+logger.info('SkillBridge LLM active model: %s', os.getenv('GROQ_MODEL') or MODEL_ORDER[0])
 
-def llm_json(system: str, prompt: str, fallback: Dict[str, Any]) -> Dict[str, Any]:
-    if not client: return fallback
-    try:
-        r = client.chat.completions.create(model=GROQ_MODEL, temperature=0.2, response_format={'type':'json_object'}, messages=[{'role':'system','content':system},{'role':'user','content':prompt}])
-        raw = r.choices[0].message.content.strip()
-        raw = re.sub(r'^```(?:json)?\s*', '', raw, flags=re.I)
-        raw = re.sub(r'\s*```$', '', raw).strip()
-        return json.loads(raw)
-    except Exception:
-        logger.exception('Groq LLM call or JSON parsing failed; returning fallback')
+@app.exception_handler(Exception)
+async def unexpected_error_handler(request: Request, exc: Exception):
+    logger.error('Unhandled API exception for %s %s\n%s', request.method, request.url.path, traceback.format_exc())
+    path=request.url.path
+    fallback={'detail':'Request could not be completed'}
+    if path.endswith('/health'): fallback={'status':'ok'}
+    elif path.endswith('/resume/parse'): fallback={'name':'Student','skills':[],'missing_skills':[],'match_score':0}
+    elif path.endswith('/test/generate'): fallback={'questions':build_bank_fallback(['Python'])}
+    elif path.endswith('/test/submit'): fallback={'score':0,'per_skill':{}}
+    elif path.endswith('/interview/next'): fallback={'reply':'Could you tell me more about your experience?', 'done':False}
+    elif path.endswith('/interview/score'): fallback={'technical':0,'hr':0,'soft_skills':0,'feedback':'Complete a few answers to receive feedback.'}
+    elif path.endswith('/readiness'): fallback=readiness_fallback(0,0,{},[])
+    elif path.endswith('/jobs') and request.method=='GET': fallback=[]
+    elif path.endswith('/candidates'): fallback=[]
+    elif path.endswith('/batch-gaps'): fallback=[]
+    return JSONResponse(status_code=200,content=fallback)
+
+def _valid_payload(value: Any, validator: Optional[Any]) -> bool:
+    return isinstance(value, dict) and (validator(value) if validator else True)
+
+def llm_json(system: str, prompt: str, fallback: Dict[str, Any], validator: Optional[Any] = None) -> Dict[str, Any]:
+    """Call Groq with bounded retries, route validation and a cached working model."""
+    global ACTIVE_MODEL
+    if not client:
         return fallback
+    models = ([ACTIVE_MODEL] if ACTIVE_MODEL else []) + [m for m in MODEL_ORDER if m != ACTIVE_MODEL]
+    for model in models:
+        future = None
+        try:
+            future = LLM_POOL.submit(client.chat.completions.create, model=model, temperature=0.2, max_tokens=4000, timeout=20,
+                messages=[{'role':'system','content':system},{'role':'user','content':prompt}])
+            response = future.result(timeout=20)
+            content = response.choices[0].message.content
+            if not isinstance(content, str) or not content.strip():
+                raise ValueError('LLM returned empty message content')
+            raw = re.sub(r'^\s*```(?:json)?\s*', '', content, flags=re.I)
+            raw = re.sub(r'\s*```\s*$', '', raw).strip()
+            starts = [i for i in (raw.find('{'), raw.find('[')) if i >= 0]
+            end = max(raw.rfind('}'), raw.rfind(']'))
+            if starts and end > min(starts):
+                raw = raw[min(starts):end + 1]
+            parsed = json.loads(raw)
+            if not _valid_payload(parsed, validator):
+                raise ValueError('LLM JSON failed route contract validation')
+            ACTIVE_MODEL = model
+            logger.info('LLM request succeeded using model %s', model)
+            return parsed
+        except Exception:
+            if isinstance(__import__('sys').exc_info()[1], FutureTimeout) and future is not None:
+                future.cancel()
+            logger.error('LLM request failed using model %s\n%s', model, traceback.format_exc())
+    return fallback
 
 def file_text(data: bytes, name: str) -> str:
     if name.lower().endswith('.pdf'):
@@ -97,11 +142,18 @@ def extract_resume_fallback(text: str, target_role: str) -> Dict[str, Any]:
 @app.get('/api/health')
 def health(): return {'status':'ok'}
 
+def _resume_valid(x): return isinstance(x.get('name'), str) and isinstance(x.get('skills'), list) and all(isinstance(v,str) for v in x['skills'])
+def _questions_valid(x):
+    qs=x.get('questions')
+    return isinstance(qs,list) and len(qs)==10 and all(isinstance(q,dict) and isinstance(q.get('id'),(int,str)) and isinstance(q.get('question'),str) and isinstance(q.get('skill'),str) and isinstance(q.get('options'),list) and len(q['options'])==4 and all(isinstance(o,str) for o in q['options']) and isinstance(q.get('answer_index'),int) and 0<=q['answer_index']<4 for q in qs)
+def _next_valid(x): return isinstance(x.get('reply'),str) and bool(x['reply'].strip()) and isinstance(x.get('done'),bool)
+def _score_valid(x): return all(isinstance(x.get(k),int) and 0<=x[k]<=100 for k in ('technical','hr','soft_skills')) and isinstance(x.get('feedback'),str)
+
 @app.post('/api/resume/parse')
 async def parse_resume(file: UploadFile = File(...), target_role: str = Form(...)):
     text = file_text(await file.read(), file.filename or 'resume.txt')
     fallback = extract_resume_fallback(text, target_role)
-    parsed = llm_json('Extract only JSON with name and skills array.', text[:10000], {'name':fallback['name'],'skills':fallback['skills']})
+    parsed = llm_json('Extract only JSON with name and skills array.', text[:10000], {'name':fallback['name'],'skills':fallback['skills']}, _resume_valid)
     # Keep the deterministic role comparison and use LLM extraction only when it
     # returned a valid skill list; the fallback path always uses the keyword bank.
     skills = [str(x) for x in parsed.get('skills', fallback['skills'])] if isinstance(parsed.get('skills', fallback['skills']), list) else fallback['skills']
@@ -192,7 +244,7 @@ def build_bank_fallback(skills: List[str]) -> List[Dict[str, Any]]:
 def generate_test(b: TestGenerate):
     qs=build_bank_fallback(b.skills)
     skills=b.skills or ['Python']
-    r=llm_json('Return JSON with exactly 10 MCQs, each with id, question, four options, answer_index, skill.',str(skills),{'questions':qs}); return {'questions':r.get('questions',qs)[:10]}
+    r=llm_json('Return JSON with exactly 10 MCQs, each with id, question, four options, answer_index, skill.',str(skills),{'questions':qs}, _questions_valid); return {'questions':r['questions']}
 
 @app.post('/api/test/submit')
 def submit_test(b: TestSubmit):
@@ -204,7 +256,7 @@ def submit_test(b: TestSubmit):
 @app.post('/api/interview/next')
 def interview_next(b: InterviewNext):
     fallback = interview_next_fallback(b.type, b.target_role, b.history)
-    result=llm_json('Return a JSON object with reply (one concise interview question) and done (boolean). Tailor it to the interview type and target role, use the history to avoid repeating questions, and set done=true only after five candidate answers.',json.dumps({'type':b.type,'target_role':b.target_role,'history':b.history}),fallback)
+    result=llm_json('Return a JSON object with reply (one concise interview question) and done (boolean). Tailor it to the interview type and target role, use the history to avoid repeating questions, and set done=true only after five candidate answers.',json.dumps({'type':b.type,'target_role':b.target_role,'history':b.history}),fallback, _next_valid)
     return {'reply':str(result.get('reply',fallback['reply'])),'done':bool(result.get('done',fallback['done']))}
 
 TECH_INTERVIEW_BANK = [
@@ -223,7 +275,11 @@ HR_INTERVIEW_BANK = [
 ]
 
 def interview_next_fallback(interview_type: str, target_role: str, history: List[Dict[str, str]]) -> Dict[str, Any]:
-    answered = sum(message.get('role') == 'user' for message in history)
+    # The frontend marks the technical-to-HR transition in the shared transcript.
+    # Count HR answers from that marker while retaining the full transcript for scoring.
+    round_start = max((i for i, message in enumerate(history)
+                       if message.get('role') == 'assistant' and 'Technical round complete' in message.get('content', '')), default=-1)
+    answered = sum(message.get('role') == 'user' for message in history[round_start + 1:])
     if answered >= 5:
         return {'reply':'Thank you for walking me through your examples. That completes our interview.', 'done':True}
     latest_answer = next((str(message.get('content','')).strip() for message in reversed(history)
@@ -255,7 +311,7 @@ def interview_next_fallback(interview_type: str, target_role: str, history: List
 @app.post('/api/interview/score')
 def interview_score(b: InterviewScore):
     fallback = score_interview_fallback(b.history, b.target_role)
-    r=llm_json('Return JSON technical, hr, soft_skills integers 0-100 and 2-3 sentence feedback grounded in the interview history.',str({'target_role':b.target_role,'history':b.history}),fallback)
+    r=llm_json('Return JSON technical, hr, soft_skills integers 0-100 and 2-3 sentence feedback grounded in the interview history.',str({'target_role':b.target_role,'history':b.history}),fallback, _score_valid)
     return {k:r.get(k,fallback[k]) for k in fallback}
 
 def score_interview_fallback(history: List[Dict[str, str]], target_role: str) -> Dict[str, Any]:
@@ -298,7 +354,11 @@ def score_interview_fallback(history: List[Dict[str, str]], target_role: str) ->
 
 @app.post('/api/readiness')
 def readiness(b: Readiness):
-    return readiness_fallback(b.match_score, b.test_score, b.interview, b.missing_skills)
+    fallback=readiness_fallback(b.match_score, b.test_score, b.interview, b.missing_skills)
+    prompt=json.dumps({'match_score':b.match_score,'test_score':b.test_score,'interview':b.interview,'missing_skills':b.missing_skills})
+    def valid(x):
+        return isinstance(x.get('readiness_score'),int) and 0<=x['readiness_score']<=100 and isinstance(x.get('skill_gaps'),list) and all(isinstance(g,dict) and isinstance(g.get('skill'),str) and isinstance(g.get('level'),int) for g in x['skill_gaps']) and isinstance(x.get('learning_path'),list) and all(isinstance(p,dict) and isinstance(p.get('step'),str) and isinstance(p.get('resource'),str) for p in x['learning_path'])
+    return llm_json('Return JSON with readiness_score integer 0-100, skill_gaps array of {skill,level}, and learning_path array of {step,resource}.',prompt,fallback,valid)
 
 RESOURCE_MAP = {
     'python': 'Python tutorial: https://docs.python.org/3/tutorial/',

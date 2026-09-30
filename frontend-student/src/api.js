@@ -1,4 +1,4 @@
-// Toggle this locally or set VITE_USE_MOCK=false to connect to FastAPI.
+// Live API is the default. Enable mocks only with VITE_USE_MOCK=true or ?mock=1.
 const queryMock = new URLSearchParams(window.location.search).get('mock') === '1'
 export const USE_MOCK = queryMock || import.meta.env.VITE_USE_MOCK === 'true'
 const BASE = import.meta.env.VITE_API_URL || 'http://localhost:8000/api'
@@ -15,9 +15,10 @@ const mock = {
  score: () => delay({ technical:76, hr:84, soft_skills:81, feedback:'You communicate clearly and show strong practical reasoning. Strengthen TypeScript depth and system-design vocabulary before interviews.' }),
  readiness: ({match_score,test_score,interview,missing_skills}) => delay({ readiness_score:Math.round(match_score*.35+test_score*.3+((interview.technical+interview.hr+interview.soft_skills)/3)*.35), skill_gaps:missing_skills.map((skill,i)=>({skill,level:[75,64,58,42][i]||50})), learning_path:[{step:'Strengthen TypeScript foundations',resource:'TypeScript Handbook — Everyday Types'},{step:'Build a tested React feature',resource:'React Testing Library tutorial'},{step:'Practice scalable UI architecture',resource:'Frontend system design checklist'}] })
 }
-async function request(path, opts={}) { const r=await fetch(`${BASE}${path}`, { headers:{'Content-Type':'application/json',...(opts.headers||{})}, ...opts }); if(!r.ok) throw new Error((await r.text()) || 'Request failed'); return r.json() }
+async function request(path, opts={}) { const controller=new AbortController(); const timer=setTimeout(()=>controller.abort(),60000); try { const r=await fetch(`${BASE}${path}`, { ...opts, signal:controller.signal, headers:{'Content-Type':'application/json',...(opts.headers||{})} }); if(!r.ok) throw new Error((await r.text()) || 'Request failed'); return await r.json() } catch(e) { if(e.name==='AbortError') throw new Error('This is taking longer than expected. Please try again.'); if(!navigator.onLine) throw new Error('You appear to be offline. Check your connection and try again.'); throw new Error(e.message || 'We couldn’t complete that request. Please try again.') } finally { clearTimeout(timer) } }
+async function upload(path, form) { const controller=new AbortController(); const timer=setTimeout(()=>controller.abort(),60000); try { const r=await fetch(`${BASE}${path}`,{method:'POST',body:form,signal:controller.signal}); if(!r.ok) throw new Error((await r.text())||'Request failed'); return await r.json() } catch(e) { if(e.name==='AbortError') throw new Error('Resume analysis timed out. Please try again.'); if(!navigator.onLine) throw new Error('You appear to be offline. Check your connection and try again.'); throw new Error(e.message || 'We couldn’t analyze your resume. Please try again.') } finally { clearTimeout(timer) } }
 export const api = {
- parse: (file,target_role) => { if(USE_MOCK) return mock.parse(); const form=new FormData(); form.append('file',file); form.append('target_role',target_role); return fetch(`${BASE}/resume/parse`,{method:'POST',body:form}).then(async r=>{if(!r.ok) throw new Error(await r.text()); return r.json()}) },
+ parse: (file,target_role) => { if(USE_MOCK) return mock.parse(); const form=new FormData(); form.append('file',file); form.append('target_role',target_role); return upload('/resume/parse',form) },
  generate: (skills) => USE_MOCK ? mock.generate() : request('/test/generate',{method:'POST',body:JSON.stringify({skills})}),
  submit: (answers, questions) => USE_MOCK ? mock.submit({answers,questions}) : request('/test/submit',{method:'POST',body:JSON.stringify({answers,questions})}),
  next: (type,target_role,history) => USE_MOCK ? mock.next({type,history}) : request('/interview/next',{method:'POST',body:JSON.stringify({type,target_role,history})}),
