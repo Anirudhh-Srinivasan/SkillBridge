@@ -13,9 +13,7 @@ import random
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 load_dotenv(os.path.join(BASE_DIR, '.env'))
-MODEL_ORDER = list(dict.fromkeys(m.strip() for m in [os.getenv('GROQ_MODEL'), 'llama-3.3-70b-versatile', 'llama-3.1-8b-instant', 'openai/gpt-oss-20b'] if m and m.strip()))
-if os.getenv('GROQ_MODEL') and 'qwen' in os.getenv('GROQ_MODEL').lower():
-    MODEL_ORDER = list(dict.fromkeys(['llama-3.3-70b-versatile', 'llama-3.1-8b-instant', 'openai/gpt-oss-20b']))
+MODEL_ORDER = list(dict.fromkeys(m.strip() for m in [os.getenv('GROQ_MODEL'), 'openai/gpt-oss-20b'] if m and m.strip()))
 ACTIVE_MODEL = None
 LLM_POOL = ThreadPoolExecutor(max_workers=4)
 logger = logging.getLogger(__name__)
