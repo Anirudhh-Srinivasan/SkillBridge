@@ -1,4 +1,4 @@
-import json, os, re
+import json, logging, os, re
 from io import BytesIO
 from typing import Any, Dict, List, Optional
 from dotenv import load_dotenv
@@ -7,21 +7,32 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from pypdf import PdfReader
 
-load_dotenv(os.path.join(os.path.dirname(__file__), '.env'))
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+load_dotenv(os.path.join(BASE_DIR, '.env'))
+GROQ_MODEL = os.getenv('GROQ_MODEL', 'llama-3.3-70b-versatile')
+logger = logging.getLogger(__name__)
 app = FastAPI(title='SkillBridge API')
 app.add_middleware(CORSMiddleware, allow_origins=['*'], allow_credentials=False, allow_methods=['*'], allow_headers=['*'])
 try:
     from groq import Groq
     client = Groq(api_key=os.getenv('GROQ_API_KEY')) if os.getenv('GROQ_API_KEY') else None
-except Exception: client = None
+except Exception:
+    logger.exception('Failed to initialize Groq client')
+    client = None
+
+logger.info('GROQ_API_KEY loaded: %s', bool(os.getenv('GROQ_API_KEY')))
 
 def llm_json(system: str, prompt: str, fallback: Dict[str, Any]) -> Dict[str, Any]:
     if not client: return fallback
     try:
-        r = client.chat.completions.create(model='llama-3.3-70b-versatile', temperature=0.2, response_format={'type':'json_object'}, messages=[{'role':'system','content':system},{'role':'user','content':prompt}])
-        raw = re.sub(r'^```(?:json)?\s*|\s*```$', '', r.choices[0].message.content.strip(), flags=re.I).strip()
+        r = client.chat.completions.create(model=GROQ_MODEL, temperature=0.2, response_format={'type':'json_object'}, messages=[{'role':'system','content':system},{'role':'user','content':prompt}])
+        raw = r.choices[0].message.content.strip()
+        raw = re.sub(r'^```(?:json)?\s*', '', raw, flags=re.I)
+        raw = re.sub(r'\s*```$', '', raw).strip()
         return json.loads(raw)
-    except Exception: return fallback
+    except Exception:
+        logger.exception('Groq LLM call or JSON parsing failed; returning fallback')
+        return fallback
 
 def file_text(data: bytes, name: str) -> str:
     if name.lower().endswith('.pdf'):
@@ -69,7 +80,11 @@ def submit_test(b: TestSubmit):
 
 @app.post('/api/interview/next')
 def interview_next(b: InterviewNext):
-    n=sum(x.get('role')=='user' for x in b.history); qs=['Tell me about a project relevant to '+b.target_role+'.','How did you debug a difficult issue?','Explain a key design decision.','How do you handle conflicting deadlines?','Why should a team choose you?'] if b.type=='technical' else ['Tell me about yourself.','Describe a time you handled feedback.','How do you collaborate?','Tell me about a failure and what you learned.','Why this role?']; return {'reply':'Thanks. '+(qs[n] if n<5 else 'That completes the interview.'),'done':n>=5}
+    n=sum(x.get('role')=='user' for x in b.history)
+    qs=['Tell me about a project relevant to '+b.target_role+'.','How did you debug a difficult issue?','Explain a key design decision.','How do you handle conflicting deadlines?','Why should a team choose you?'] if b.type=='technical' else ['Tell me about yourself.','Describe a time you handled feedback.','How do you collaborate?','Tell me about a failure and what you learned.','Why this role?']
+    fallback={'reply':qs[n] if n<5 else 'That completes the interview.','done':n>=5}
+    result=llm_json('Return a JSON object with reply (one concise interview question) and done (boolean). Tailor it to the interview type and target role, use the history to avoid repeating questions, and set done=true only after five candidate answers.',json.dumps({'type':b.type,'target_role':b.target_role,'history':b.history}),fallback)
+    return {'reply':str(result.get('reply',fallback['reply'])),'done':bool(result.get('done',fallback['done']))}
 
 @app.post('/api/interview/score')
 def interview_score(b: InterviewScore):
