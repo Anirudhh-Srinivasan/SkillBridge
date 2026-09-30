@@ -1,4 +1,4 @@
-import React, {createContext, useContext, useEffect, useState} from 'react'
+import React, {createContext, useContext, useEffect, useRef, useState} from 'react'
 import {createRoot} from 'react-dom/client'
 import {BrowserRouter, Navigate, useLocation, useNavigate} from 'react-router-dom'
 import {Radar, RadarChart, PolarGrid, PolarAngleAxis, ResponsiveContainer} from 'recharts'
@@ -17,6 +17,50 @@ function Ring({value,label}){return <div className="ring" style={{'--p':`${value
 function Skills(){const nav=useNavigate(),{data}=useFlow();if(!data.profile)return <Navigate to="/"/>;const p=data.profile;return <Shell><div className="page-head"><p className="eyebrow">Profile analysis</p><h2>Your skill map, {p.name.split(' ')[0]}.</h2><p>We found a solid starting point—and a focused way forward.</p></div><div className="skills-layout"><Card><h3>Skills detected</h3><div className="chips">{p.skills.map(x=><span className="chip good" key={x}>{x}</span>)}</div><h3>Skills to strengthen</h3><div className="chips">{p.missing_skills.map(x=><span className="chip gap" key={x}>{x}</span>)}</div></Card><Card className="score-card"><Ring value={p.match_score} label="role match"/><p>Your resume aligns with the core requirements for <b>{data.target_role}</b>.</p></Card></div><button className="next" onClick={()=>nav('/test')}>Start skill assessment <ArrowRight size={18}/></button></Shell>}
 function Test(){const nav=useNavigate(),{data,setData}=useFlow(),[qs,setQs]=useState(data.questions||[]),[index,setIndex]=useState(0),[answers,setAnswers]=useState([]),[loading,setLoading]=useState(!data.questions),[submitLoading,setSubmitLoading]=useState(false),[error,setError]=useState(''),[left,setLeft]=useState(600);useEffect(()=>{if(!data.profile)return; if(!data.questions)api.generate(data.profile.missing_skills).then(r=>{setQs(r.questions);setData(d=>({...d,questions:r.questions}))}).catch(e=>setError(e.message)).finally(()=>setLoading(false))},[]);useEffect(()=>{if(loading)return;const t=setInterval(()=>setLeft(x=>Math.max(0,x-1)),1000);return()=>clearInterval(t)},[loading]);if(!data.profile)return <Navigate to="/"/>;const choose=async selected=>{const a=[...answers.filter(x=>x.id!==qs[index].id),{id:qs[index].id,selected}];setAnswers(a);if(index<qs.length-1)setIndex(index+1);else{setSubmitLoading(true);try{const test=await api.submit(a,qs);setData(d=>({...d,test}));nav('/interview')}catch(e){setError(e.message);setSubmitLoading(false)}}};if(loading)return <Shell><Loading text="Generating a focused assessment…"/></Shell>;const q=qs[index];return <Shell><div className="test-top"><span>Question {index+1} of {qs.length}</span><span><Clock3 size={16}/>{String(Math.floor(left/60)).padStart(2,'0')}:{String(left%60).padStart(2,'0')}</span></div><div className="progress"><i style={{width:`${(index/qs.length)*100}%`}}/></div><Card className="question"><span className="pill">{q.skill}</span><h2>{q.question}</h2><div className="options">{q.options.map((x,i)=><button key={x} disabled={submitLoading} onClick={()=>choose(i)}><b>{'ABCD'[i]}</b>{x}</button>)}</div></Card>{submitLoading&&<Loading text="Scoring your responses…"/>}<Error error={error}/></Shell>}
 function Loading({text}){return <div className="loading"><LoaderCircle className="spin"/><span>{text}</span></div>}
-function Interview(){const nav=useNavigate(),{data,setData}=useFlow(),[type,setType]=useState('technical'),[history,setHistory]=useState(data.history||[]),[input,setInput]=useState(''),[loading,setLoading]=useState(false),[error,setError]=useState('');if(!data.test)return <Navigate to="/test"/>;const ask=async h=>{setLoading(true);try{const r=await api.next(type,data.target_role,h);const next=[...h,{role:'assistant',content:r.reply}];setHistory(next);setData(d=>({...d,history:next}));if(r.done){if(type==='technical'){setType('hr');const starter=[...next,{role:'assistant',content:'Technical round complete. Let’s switch to the HR round.'}];setHistory(starter);await ask(starter)}else{const interview=await api.score(next,data.target_role);setData(d=>({...d,interview}));nav('/results')}}}catch(e){setError(e.message)}finally{setLoading(false)}};useEffect(()=>{if(!history.length)ask([])},[]);const send=()=>{if(!input.trim()||loading)return;const h=[...history,{role:'user',content:input.trim()}];setHistory(h);setInput('');ask(h)};return <Shell><div className="page-head compact"><p className="eyebrow">Mock interview</p><h2>{type==='technical'?'Technical round':'HR round'} <span className="live">● live</span></h2><p>Answer naturally. You’ll get constructive feedback at the end.</p></div><Card className="chat"><div className="chatlog">{history.map((m,i)=><div className={'message '+m.role} key={i}>{m.content}</div>)}{loading&&<div className="typing"><i/><i/><i/></div>}</div><div className="composer"><input value={input} disabled={loading} onKeyDown={e=>e.key==='Enter'&&send()} onChange={e=>setInput(e.target.value)} placeholder="Type your answer…"/><button onClick={send} disabled={loading||!input.trim()}><Send size={18}/></button></div></Card><Error error={error}/></Shell>}
+function Interview(){
+ const nav=useNavigate(),{data,setData}=useFlow(),saved=data.interviewFlow||{}
+ const [type,setType]=useState(saved.type||'technical'),[history,setHistory]=useState(saved.history||[]),[roundHistory,setRoundHistory]=useState(saved.roundHistory||[]),[answersInRound,setAnswersInRound]=useState(saved.answersInRound||0),[input,setInput]=useState(''),[loading,setLoading]=useState(false),[error,setError]=useState('')
+ const requesting=useRef(false),finishing=useRef(false)
+ if(!data.test)return <Navigate to="/test"/>
+ const persist=patch=>setData(d=>({...d,interviewFlow:{...(d.interviewFlow||{}),...patch}}))
+ const requestNext=async(round,currentRoundHistory,answerCount,currentChat)=>{
+   if(requesting.current||finishing.current)return
+   requesting.current=true;setLoading(true);setError('')
+   let startHrChat=null
+   try{
+     // The backend counts user messages, so this deliberately contains only one round.
+     const response=await api.next(round,data.target_role,currentRoundHistory)
+     const nextRoundHistory=[...currentRoundHistory,{role:'assistant',content:response.reply}]
+     const nextChat=[...currentChat,{role:'assistant',content:response.reply}]
+     setRoundHistory(nextRoundHistory);setHistory(nextChat)
+     persist({type:round,history:nextChat,roundHistory:nextRoundHistory,answersInRound:answerCount})
+     if(answerCount >= 5){
+       if(round==='technical'){
+         const transitioned=[...nextChat,{role:'assistant',content:'Technical round complete. Let’s switch to the HR round.'}]
+         setType('hr');setAnswersInRound(0);setRoundHistory([]);setHistory(transitioned)
+         persist({type:'hr',history:transitioned,roundHistory:[],answersInRound:0})
+         startHrChat=transitioned
+       }else{
+         finishing.current=true
+         const interview=await api.score(nextChat,data.target_role)
+         setData(d=>({...d,interview,interviewFlow:{...(d.interviewFlow||{}),history:nextChat,roundHistory:nextRoundHistory,answersInRound:answerCount}}))
+         nav('/results')
+       }
+     }
+   }catch(e){setError(e.message)}finally{requesting.current=false;setLoading(false)}
+   if(startHrChat) void requestNext('hr',[],0,startHrChat)
+ }
+ useEffect(()=>{if(!roundHistory.length) void requestNext(type,[],answersInRound,history)},[])
+ const submitAnswer=content=>{
+   if(!content.trim()||loading||requesting.current||finishing.current)return
+   const answer={role:'user',content:content.trim()},nextRoundHistory=[...roundHistory,answer],nextChat=[...history,answer],nextCount=answersInRound+1
+   requesting.current=true // reserve the request synchronously to block Enter/click double-submits
+   setHistory(nextChat);setRoundHistory(nextRoundHistory);setAnswersInRound(nextCount);setInput('')
+   persist({type,history:nextChat,roundHistory:nextRoundHistory,answersInRound:nextCount})
+   requesting.current=false
+   void requestNext(type,nextRoundHistory,nextCount,nextChat)
+ }
+ const roundName=type==='technical'?'Technical':'HR'
+ return <Shell><div className="page-head compact"><p className="eyebrow">Mock interview</p><h2>{roundName} round <span className="live">● live</span></h2><p>Question {Math.min(answersInRound+1,5)} of 5 - {roundName}. Answer naturally, or skip it.</p></div><Card className="chat"><div className="chatlog">{history.map((m,i)=><div className={'message '+m.role} key={i}>{m.content}</div>)}{loading&&<div className="typing"><i/><i/><i/></div>}</div><div className="composer"><input value={input} disabled={loading} onKeyDown={e=>e.key==='Enter'&&submitAnswer(input)} onChange={e=>setInput(e.target.value)} placeholder="Type your answer…"/><button className="skip" onClick={()=>submitAnswer('Skipped this question.')} disabled={loading}>Skip</button><button onClick={()=>submitAnswer(input)} disabled={loading||!input.trim()}><Send size={18}/></button></div></Card><Error error={error}/></Shell>}
 function Results(){const {data,setData}=useFlow(),[ready,setReady]=useState(data.readiness),[loading,setLoading]=useState(!data.readiness),[error,setError]=useState('');useEffect(()=>{if(!data.interview)return;if(!data.readiness)api.readiness({match_score:data.profile.match_score,test_score:data.test.score,interview:data.interview,missing_skills:data.profile.missing_skills}).then(x=>{setReady(x);setData(d=>({...d,readiness:x}))}).catch(e=>setError(e.message)).finally(()=>setLoading(false))},[]);if(!data.interview)return <Navigate to="/interview"/>;if(loading)return <Shell><Loading text="Building your personalized readiness report…"/></Shell>;const radar=ready.skill_gaps.map(x=>({skill:x.skill,level:100-x.level}));return <Shell><div className="page-head"><p className="eyebrow">Your verified profile</p><h2>Ready for what’s next.</h2><p>Here’s your complete interview-readiness snapshot.</p></div><div className="results-grid"><Card className="readiness"><Ring value={ready.readiness_score} label="readiness score"/><p>Keep building momentum: your next best gains are clear.</p></Card><Card><h3>Skill confidence</h3><div className="radar"><ResponsiveContainer><RadarChart data={radar}><PolarGrid stroke="#315064"/><PolarAngleAxis dataKey="skill" tick={{fill:'#a9bfcc',fontSize:11}}/><Radar dataKey="level" stroke="#2dd4bf" fill="#2dd4bf" fillOpacity={.35}/></RadarChart></ResponsiveContainer></div></Card></div><div className="results-grid lower"><Card><h3>Interview scorecard</h3>{[['Technical',data.interview.technical],['HR',data.interview.hr],['Soft skills',data.interview.soft_skills],['Assessment',data.test.score]].map(([n,v])=><div className="bar" key={n}><span>{n}</span><i><b style={{width:`${v}%`}}/></i><strong>{v}</strong></div>)}<p className="feedback">“{data.interview.feedback}”</p></Card><Card><h3>Your learning path</h3><ol className="timeline">{ready.learning_path.map((x,i)=><li key={x.step}><b>{i+1}</b><div><strong>{x.step}</strong><small>{x.resource}</small></div></li>)}</ol></Card></div><Error error={error}/><button className="print" onClick={()=>window.print()}><FileText size={18}/> Download report</button></Shell>}
 function App(){const path=useLocation().pathname;return path==='/'?<UploadPage/>:path==='/skills'?<Skills/>:path==='/test'?<Test/>:path==='/interview'?<Interview/>:path==='/results'?<Results/>:<Navigate to="/"/>}createRoot(document.getElementById('root')).render(<BrowserRouter><Provider><App/></Provider></BrowserRouter>)
